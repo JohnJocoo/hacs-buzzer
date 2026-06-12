@@ -1,0 +1,27 @@
+{
+  "config": {
+    "flow_title": "{name}",
+    "step": {
+      "bluetooth_confirm": {
+        "description": "Do you want to set up {name}?"
+      },
+      "user": {
+        "description": "Choose a Buzzer Tag to set up.",
+        "data": {
+          "address": "Device"
+        }
+      }
+    },
+    "abort": {
+      "no_devices_found": "No Buzzer Tag found nearby. The tag only advertises for ~10 seconds at a time; press its button to wake it, then try again.",
+      "already_configured": "This Buzzer Tag is already configured."
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "buzzing": {
+        "name": "Buzzing"
+      }
+    }
+  }
+}

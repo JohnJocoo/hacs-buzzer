@@ -1,0 +1,293 @@
+================================================================================
+GUIDE FOR CLAUDE: BUILD A BLEAK TEST SCRIPT AND A HOME ASSISTANT INTEGRATION
+FOR THE "BUZZER TAG" BLE PERIPHERAL
+================================================================================
+
+PURPOSE
+-------
+You (Claude) are asked to create either, or both, of:
+  (A) a standalone Python test script using `bleak` that can: scan, connect,
+      buzz_on, buzz_off; and
+  (B) a Home Assistant custom integration exposing the same control.
+
+This file is the complete contract. It is written so you do NOT need to read the
+Zephyr firmware source to implement the clients. If anything below is ambiguous,
+prefer the values in the "DEVICE CONTRACT" section - they come directly from the
+firmware (samples/my_beacon).
+
+*** IMPORTANT - this firmware uses NO encryption and NO pairing/bonding. ***
+The buzz characteristic is a plain (unencrypted) write. Do NOT call pair(); it is
+unnecessary and may error on some backends. Just connect and write.
+
+
+================================================================================
+DEVICE CONTRACT (authoritative)
+================================================================================
+
+Device / advertising
+  - Role:               connectable BLE peripheral (GATT server).
+  - Advertised name:    "Buzzer Tag"   (BT_DATA_NAME_COMPLETE in adv data)
+  - Appearance:         512 (0x0200, "Generic Tag")
+  - Scan response:      advertises the 128-bit service UUID (UUID128_ALL), so you
+                        may match on the service UUID OR the name.
+  - Address:            stable static random address (privacy/RPA is NOT enabled),
+                        so the address is constant across reboots.
+  - On wake the device first tries a DIRECTED advertise at the address of the
+    central it last talked to, then falls back to normal undirected advertising.
+
+GATT service
+  - Service UUID:       12340000-1234-5678-1234-56789abcdef0
+  - Characteristic:     12340001-1234-5678-1234-56789abcdef0   ("buzz" char)
+      Properties:       Write, Write Without Response
+      Permission:       PLAIN write - NO encryption / NO authentication required.
+    - Characteristic:     12340002-1234-5678-1234-56789abcdef0   ("status" char)
+      Properties:       Read, Notify
+      Payload:          2 bytes: [buzz status, battery percent]
+
+Write payload (exactly 1 byte)
+  - 0x01        -> buzz_on  : start the preset melody. The melody is a short
+                              (~5 s) tune of tones with silent gaps, and it LOOPS
+                              for up to 2 MINUTES, then stops by itself.
+  - 0x02        -> status   : do not change playback; just report the current
+                              status immediately (notification).
+  - 0x00        -> buzz_off : stop the melody immediately.
+  Notes:
+  - ONLY 0x00, 0x01, and 0x02 are accepted. Any other value (0x03..0xFF) is
+    rejected with ATT error 0x13 (Value Not Allowed). "Any non-zero byte" does
+    NOT work - send exactly 0x01 to buzz.
+  - Writing 0x01 again while playing restarts the melody and resets the 2 min
+    timer. To read the current buzz state without changing it, read (or subscribe
+    to) the status characteristic 12340002-... , or write 0x02 to force a status
+    notification.
+  - A write with length != 1 is rejected (ATT invalid length). Always send 1 byte.
+  - IMPORTANT: playback is INDEPENDENT of the BLE connection. After you write 0x01
+    you may disconnect (or your script may exit) and the buzzer keeps playing
+    until the 2 min timeout. To stop early you must RECONNECT and write 0x00. Do
+    not assume disconnecting silences it.
+  - Status notifications follow the buzz state byte, with a second byte carrying a
+    coarse CR2032 battery percentage estimate (0-100, 100 = full). They are
+    emitted when you subscribe, when playback starts, when it ends, and just
+    before the device goes to sleep.
+
+Security / "remembering" the central
+  - NO pairing, NO bonding, NO encryption. The link is always unauthenticated and
+    unencrypted; the buzz characteristic is writable by any connected central.
+  - The device DOES "remember" its central, but only at the application level: it
+    stores the first central's address in flash. This is used for power-state
+    decisions and the directed reconnect on wake. It does NOT gate the buzzer and
+    carries no keys - your client never has to pair or manage keys.
+
+Power management / CONNECTION MODEL (critical for client design)
+  - The device is designed to be HELD CONNECTED ("option A"). Once you connect:
+      * It STAYS connected (it does NOT drop you to sleep), and it requests a
+        slow, low-power connection so the held link stays cheap.
+      * The CENTRAL decides the final connection parameters. macOS/iOS cap the
+        effective interval at ~2 s, so a command you write lands within ~2 s.
+        BlueZ / Home Assistant may grant a slower link (lower power, higher
+        latency). Either way: keep the connection open and just write when you
+        want to buzz.
+  - States / connectability:
+      * First 2 min after boot with NO remembered central: awake & advertising
+        (setup window).
+      * Connected: stays connected (the normal steady state). LED is off.
+      * If the link DROPS: the device advertises (undirected) for ~10 s to let
+        you reconnect. If you don't, it enters a recovery cycle - advertise
+        ~10 s, sleep ~5 min, repeat - so it is only connectable in those ~10 s
+        windows until you reconnect.
+      * No central within the 2 min setup window after boot: System OFF (fully
+        off) until a button press reboots it into a fresh 2 min window.
+  - Practical patterns:
+      * Best (HA-style): connect once and KEEP the connection; write the buzz
+        char whenever you want; commands land within ~2 s. Reconnect on the
+        disconnected callback if the link ever drops.
+      * On-demand (script-style): you can also connect, write, disconnect - but
+        if the link dropped you may have to wait for a ~10 s advertising window
+        (after a drop, or every ~5 min in recovery), so RETRY connecting in a
+        loop for ~70-80 s. Treat "couldn't connect" as "in a recovery gap, try
+        again", not "missing".
+  - While a melody is playing the device stays awake/connected, so you can
+    reliably send buzz-off during playback.
+
+Factory reset (firmware side, for your awareness)
+  - Holding the device button for 3 s forgets the remembered central and reboots.
+    This is not relevant to client auth (there is none), but it does reset the
+    power state machine back to the 2 min setup window.
+
+
+================================================================================
+PART A - BLEAK TEST SCRIPT (deliverable: buzzer_tag_test.py)
+================================================================================
+
+Goal: a single CLI script with subcommands or flags:
+  scan        -> list nearby devices matching name/service, print address+RSSI
+  buzz-on     -> connect (with retries), write 0x01, disconnect
+  buzz-off    -> connect (with retries), write 0x00, disconnect
+Optionally a combined demo: scan -> connect -> buzz_on -> wait N s -> buzz_off
+(note: the wait may need a RECONNECT for buzz_off, since the device may have
+disconnected you in the meantime - see "expect disconnects" below).
+
+Requirements / constraints for the script:
+  - Python 3.9+; dependency: `bleak` (pip install bleak, >= 0.21). Use asyncio.
+  - Define constants from the DEVICE CONTRACT (don't hardcode magic literals
+    inline):
+        DEVICE_NAME = "Buzzer Tag"
+        SERVICE_UUID = "12340000-1234-5678-1234-56789abcdef0"
+        BUZZ_CHAR_UUID = "12340001-1234-5678-1234-56789abcdef0"
+        STATUS_CHAR_UUID = "12340002-1234-5678-1234-56789abcdef0"
+        BUZZ_ON, BUZZ_OFF, BUZZ_STATUS = bytes([1]), bytes([0]), bytes([2])
+  - NO pairing. Do NOT call client.pair(). The write is plain; it just works once
+    connected.
+  - Scan: BleakScanner.discover(timeout=...) or find_device_by_filter. Match by
+    name == DEVICE_NAME or by SERVICE_UUID in advertisement service_uuids. Allow
+    passing an explicit address to skip scanning.
+  - CONNECT, then KEEP the link (preferred): once connected the device stays
+    connected and you can write whenever; commands land within ~2 s. Register a
+    disconnected callback and reconnect if the link ever drops.
+  - RETRY CONNECT: the device is normally already connected, but if it dropped it
+    is only advertising in ~10 s windows (after a drop, or every ~5 min in
+    recovery). So wrap connect in a retry loop: attempt; on failure/timeout wait
+    ~3-5 s and retry; up to ~80 s total. Do NOT treat the first failure as
+    "device gone".
+  - Write: `await client.write_gatt_char(BUZZ_CHAR_UUID, BUZZ_ON, response=True)`.
+    The char supports both with- and without-response; response=True gives clearer
+    errors for a test tool, so prefer it.
+  - Status (optional): read STATUS_CHAR_UUID for [buzz_state, battery_pct], or
+    start_notify() on it to observe changes.
+  - Error handling: catch BleakError / BleakDeviceNotFoundError. There is no
+    auth/encryption error to handle anymore - if a write fails it is almost always
+    a transient disconnect; reconnect and retry.
+  - UX: argparse CLI, sensible defaults (scan timeout ~10 s), --address option,
+    --duration for the on->wait->off demo, informative prints.
+
+Reference skeleton (illustrative, not final):
+
+    import argparse, asyncio
+    from bleak import BleakScanner, BleakClient
+    from bleak.exc import BleakError
+
+    DEVICE_NAME = "Buzzer Tag"
+    SERVICE_UUID = "12340000-1234-5678-1234-56789abcdef0"
+    BUZZ_CHAR_UUID = "12340001-1234-5678-1234-56789abcdef0"
+    BUZZ_ON, BUZZ_OFF = bytes([1]), bytes([0])
+
+    async def find_address():
+        dev = await BleakScanner.find_device_by_filter(
+            lambda d, ad: (d.name == DEVICE_NAME)
+                          or (SERVICE_UUID in (ad.service_uuids or [])),
+            timeout=10.0,
+        )
+        return dev.address if dev else None
+
+    async def connect_with_retry(address, total_s=80):
+        import time
+        deadline = time.monotonic() + total_s
+        while time.monotonic() < deadline:
+            try:
+                client = BleakClient(address)
+                await client.connect()
+                return client
+            except Exception:
+                await asyncio.sleep(4)   # asleep; try again next wake window
+        raise TimeoutError("tag never became connectable")
+
+    async def write_buzz(address, payload):
+        client = await connect_with_retry(address)
+        try:
+            await client.write_gatt_char(BUZZ_CHAR_UUID, payload, response=True)
+        finally:
+            await client.disconnect()
+
+    # wire up argparse subcommands: scan / buzz-on / buzz-off / demo
+
+Verification the script should perform / suggest to the user:
+  - `scan` prints the Tag with a non-empty address.
+  - `buzz-on` -> the buzzer audibly plays the looping melody (after the connect
+    retries land in a wake window - may take up to ~1 min).
+  - `buzz-off` -> reconnect and it stops within a step (<~1 s).
+  - No pairing prompt ever appears.
+
+
+================================================================================
+PART B - HOME ASSISTANT INTEGRATION (deliverable: custom_components/buzzer_tag/)
+================================================================================
+
+Design summary
+  - Build a config-flow integration, DISCOVERED via Bluetooth, exposing one entity
+    (a switch: on = play looping melody, off = stop; or a button = play).
+  - There is NO pairing/encryption, so the integration just connects and writes
+    the plain characteristic - much simpler than a bonded device.
+  - The firmware auto-stops the melody after 2 min, so a switch's "on" state may
+    drift; either let it drift or add an optimistic ~2 min timer that flips it off.
+
+Files (HA custom component layout):
+  custom_components/buzzer_tag/
+    manifest.json, __init__.py, config_flow.py, const.py, switch.py (or button.py),
+    strings.json / translations/en.json (optional).
+
+const.py
+    DOMAIN = "buzzer_tag"
+    SERVICE_UUID = "12340000-1234-5678-1234-56789abcdef0"
+    BUZZ_CHAR_UUID = "12340001-1234-5678-1234-56789abcdef0"
+    DEVICE_NAME = "Buzzer Tag"
+    BUZZ_ON, BUZZ_OFF = b"\x01", b"\x00"
+    MELODY_TIMEOUT_S = 120
+
+manifest.json (key parts)
+    {
+      "domain": "buzzer_tag", "name": "Buzzer Tag", "version": "0.1.0",
+      "iot_class": "local_push",
+      "dependencies": ["bluetooth_adapters"],
+      "requirements": ["bleak-retry-connector>=3.0.0"],
+      "config_flow": true,
+      "bluetooth": [
+        { "service_uuid": "12340000-1234-5678-1234-56789abcdef0" },
+        { "local_name": "Buzzer Tag" }
+      ]
+    }
+
+config_flow.py
+  - async_step_bluetooth(discovery_info): set unique_id to discovery_info.address,
+    abort_if_unique_id_configured(), confirm step, create entry storing the
+    address. Also async_step_user with a manual address fallback.
+
+switch.py (core behavior)
+  - Connect with bleak-retry-connector (it absorbs transient drops and the ~10 s
+    reconnect/recovery advertising windows):
+        from homeassistant.components import bluetooth
+        from bleak_retry_connector import establish_connection
+        ble_device = bluetooth.async_ble_device_from_address(hass, address,
+                                                             connectable=True)
+        client = await establish_connection(BleakClient, ble_device, name)
+        await client.write_gatt_char(BUZZ_CHAR_UUID, BUZZ_ON, response=True)
+  - async_turn_on -> write BUZZ_ON; async_turn_off -> write BUZZ_OFF.
+  - NO pairing step. There is no encryption to set up.
+  - The device is meant to be HELD CONNECTED: keep the connection open and write
+    on demand (commands land within ~2 s; the firmware already requests a
+    low-power connection so a held link is cheap). HA's bluetooth stack normally
+    keeps the link; if it drops, reconnect via establish_connection (it retries
+    into the ~10 s advertising windows). On-demand connect/write/disconnect also
+    works but adds reconnect latency.
+  - device_info: identifiers {(DOMAIN, address)}, name "Buzzer Tag".
+
+Verification for the HA integration
+  - HA's Bluetooth panel auto-discovers "Buzzer Tag" and offers to add it.
+  - The switch turns the buzzer on/off (near-immediate over a held link; up to a
+    few minutes if HA has to wait for a recovery advertising window to reconnect).
+  - Restarting the Tag does not require re-adding it in HA.
+
+
+================================================================================
+QUICK REFERENCE (copy/paste constants)
+================================================================================
+  Name:           Buzzer Tag
+  Service UUID:   12340000-1234-5678-1234-56789abcdef0
+  Buzz char UUID: 12340001-1234-5678-1234-56789abcdef0  (PLAIN write, no encryption)
+  Status UUID:    12340002-1234-5678-1234-56789abcdef0  (read/notify [state, batt%])
+  buzz_on  = single byte 0x01  (ONLY 0x01 plays; melody loops up to 2 min)
+  buzz_off = single byte 0x00
+  status   = single byte 0x02  (report status only; no playback change)
+  Other values (0x03..0xFF) are rejected (ATT 0x13 Value Not Allowed).
+  NO pairing/bonding. Device stays CONNECTED (held link, low-power ~2 s interval);
+  keep the connection open and write on demand. If it drops it advertises ~10 s,
+  then ~10 s every ~5 min (recovery), so reconnect with retries.
+================================================================================
