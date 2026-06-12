@@ -43,6 +43,7 @@ from .const import (
     HEALTH_CHECK_INTERVAL_S,
     RECONNECT_BACKOFF_S,
     STATUS_CHAR_UUID,
+    STATUS_POLL_INTERVAL_H,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -68,6 +69,7 @@ class BuzzerTagConnection:
         self._reconnect_wake = asyncio.Event()
         self._cancel_advertisement: CALLBACK_TYPE | None = None
         self._cancel_health_check: CALLBACK_TYPE | None = None
+        self._cancel_status_poll: CALLBACK_TYPE | None = None
 
         self._connected = False
         self._expected_disconnect = False
@@ -122,6 +124,12 @@ class BuzzerTagConnection:
             self._async_health_check,
             timedelta(seconds=HEALTH_CHECK_INTERVAL_S),
         )
+        # Refresh the battery reading on an idle device by polling status daily.
+        self._cancel_status_poll = async_track_time_interval(
+            self.hass,
+            self._async_poll_status,
+            timedelta(hours=STATUS_POLL_INTERVAL_H),
+        )
         # Best effort: the tag may be asleep right now. If so, the reconnect loop
         # (and the advertisement callback) will connect us as soon as it next
         # advertises, so we do NOT fail setup over a sleeping device.
@@ -145,6 +153,9 @@ class BuzzerTagConnection:
         if self._cancel_health_check is not None:
             self._cancel_health_check()
             self._cancel_health_check = None
+        if self._cancel_status_poll is not None:
+            self._cancel_status_poll()
+            self._cancel_status_poll = None
         # Wake the reconnect loop so it observes _stopped and exits promptly.
         self._reconnect_wake.set()
         if self._reconnect_task is not None:
@@ -296,6 +307,20 @@ class BuzzerTagConnection:
             self._note_disconnected()
         if not self._connected:
             self._async_schedule_reconnect()
+
+    async def _async_poll_status(self, _now) -> None:
+        """Daily: ask the device for a fresh status so battery % stays current.
+
+        Only meaningful over the held link; if we are disconnected we skip it
+        (waking a sleeping device just to read battery is not worth the energy,
+        and a reconnect refreshes status on its own).
+        """
+        if self._stopped or not self._connected:
+            return
+        try:
+            await self.async_request_status()
+        except Exception as err:  # noqa: BLE001 - transient, just wait for next poll
+            _LOGGER.debug("Status poll for %s failed: %s", self._address, err)
 
     def _on_disconnected(self, client: BleakClientWithServiceCache) -> None:
         """bleak disconnect callback (may run off the event loop)."""

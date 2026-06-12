@@ -31,3 +31,9 @@ RECONNECT_BACKOFF_S: Final = 20
 # Periodic check that flips us into "reconnect" mode if the held link has gone
 # stale without a disconnect callback ever firing (e.g. after a battery swap).
 HEALTH_CHECK_INTERVAL_S: Final = 30
+
+# The device only pushes a status notification on events (subscribe, play start/
+# stop, before sleep). To keep the battery reading fresh on an otherwise idle
+# device, poll the status char (write 0x02) on this cadence. Battery drifts
+# slowly, so once a day is plenty.
+STATUS_POLL_INTERVAL_H: Final = 24

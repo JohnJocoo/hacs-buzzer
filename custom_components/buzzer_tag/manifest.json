@@ -1,7 +1,7 @@
 {
   "domain": "buzzer_tag",
   "name": "Buzzer Tag",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "documentation": "https://github.com/JohnJocoo/hacs-buzzer",
   "issue_tracker": "https://github.com/JohnJocoo/hacs-buzzer/issues",
   "codeowners": ["@JohnJocoo"],
