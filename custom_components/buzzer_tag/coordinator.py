@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
+from datetime import timedelta
 
 from bleak.backends.characteristic import BleakGATTCharacteristic
 from bleak.exc import BleakError
@@ -31,6 +32,7 @@ from homeassistant.components.bluetooth import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
+from homeassistant.helpers.event import async_track_time_interval
 
 from .const import (
     BUZZ_CHAR_UUID,
@@ -38,6 +40,8 @@ from .const import (
     BUZZ_ON,
     BUZZ_STATUS,
     DEVICE_NAME,
+    HEALTH_CHECK_INTERVAL_S,
+    RECONNECT_BACKOFF_S,
     STATUS_CHAR_UUID,
 )
 
@@ -61,7 +65,9 @@ class BuzzerTagConnection:
         self._client: BleakClientWithServiceCache | None = None
         self._connect_lock = asyncio.Lock()
         self._reconnect_task: asyncio.Task | None = None
+        self._reconnect_wake = asyncio.Event()
         self._cancel_advertisement: CALLBACK_TYPE | None = None
+        self._cancel_health_check: CALLBACK_TYPE | None = None
 
         self._connected = False
         self._expected_disconnect = False
@@ -109,18 +115,25 @@ class BuzzerTagConnection:
             BluetoothCallbackMatcher(address=self._address, connectable=True),
             bluetooth.BluetoothScanningMode.ACTIVE,
         )
-        # Best effort: the tag may be asleep right now. If so, the advertisement
-        # callback above will reconnect us as soon as it next advertises, so we
-        # do NOT fail setup over a sleeping device.
+        # Backstop: independently of advertisement callbacks, periodically verify
+        # the held link is alive and kick a reconnect if it is not.
+        self._cancel_health_check = async_track_time_interval(
+            self.hass,
+            self._async_health_check,
+            timedelta(seconds=HEALTH_CHECK_INTERVAL_S),
+        )
+        # Best effort: the tag may be asleep right now. If so, the reconnect loop
+        # (and the advertisement callback) will connect us as soon as it next
+        # advertises, so we do NOT fail setup over a sleeping device.
         try:
             await self._async_connect()
-        except BleakError as err:
+        except Exception as err:  # noqa: BLE001 - any failure -> keep retrying
             _LOGGER.debug(
-                "Initial connect to %s failed; will reconnect when it next "
-                "advertises: %s",
+                "Initial connect to %s failed; will keep retrying: %s",
                 self._address,
                 err,
             )
+            self._async_schedule_reconnect()
 
     async def async_stop(self) -> None:
         """Tear down the connection and all callbacks."""
@@ -129,6 +142,11 @@ class BuzzerTagConnection:
         if self._cancel_advertisement is not None:
             self._cancel_advertisement()
             self._cancel_advertisement = None
+        if self._cancel_health_check is not None:
+            self._cancel_health_check()
+            self._cancel_health_check = None
+        # Wake the reconnect loop so it observes _stopped and exits promptly.
+        self._reconnect_wake.set()
         if self._reconnect_task is not None:
             self._reconnect_task.cancel()
             self._reconnect_task = None
@@ -248,10 +266,36 @@ class BuzzerTagConnection:
     def _on_advertisement(
         self, service_info: BluetoothServiceInfoBleak, change: BluetoothChange
     ) -> None:
-        """Reconnect when the tag advertises and we are not connected."""
-        if self._stopped or self._connected:
+        """React to a connectable advertisement from our device.
+
+        A connectable advertisement means the tag is NOT in a connection right
+        now. So if we still believe we are connected, our held link is stale
+        (e.g. the device rebooted after a battery swap before the OS noticed the
+        drop) - treat it as disconnected and reconnect.
+        """
+        if self._stopped:
             return
+        link_alive = self._client is not None and self._client.is_connected
+        if self._connected and link_alive:
+            # We genuinely hold the link; a stray advert needs no action.
+            return
+        if self._connected and not link_alive:
+            self._note_disconnected()
+        # Wake the reconnect loop (or start it) so we grab this advert window.
         self._async_schedule_reconnect()
+        self._reconnect_wake.set()
+
+    @callback
+    def _async_health_check(self, _now) -> None:
+        """Periodic backstop: detect a stale link even with no disconnect event."""
+        if self._stopped:
+            return
+        link_alive = self._client is not None and self._client.is_connected
+        if self._connected and not link_alive:
+            _LOGGER.debug("%s link found dead during health check", self._address)
+            self._note_disconnected()
+        if not self._connected:
+            self._async_schedule_reconnect()
 
     def _on_disconnected(self, client: BleakClientWithServiceCache) -> None:
         """bleak disconnect callback (may run off the event loop)."""
@@ -259,37 +303,68 @@ class BuzzerTagConnection:
 
     @callback
     def _handle_disconnected(self) -> None:
-        """Mark the link down and try to reconnect."""
+        """Mark the link down and start trying to reconnect."""
+        self._note_disconnected()
+        if self._stopped or self._expected_disconnect:
+            return
+        _LOGGER.debug("%s disconnected; starting reconnect", self._address)
+        self._async_schedule_reconnect()
+
+    @callback
+    def _note_disconnected(self) -> None:
+        """Flip internal state to disconnected and notify entities."""
+        if not self._connected and self._client is None:
+            return
         self._connected = False
+        self._client = None
         # The melody plays independently of the link, so the true buzz state is
         # now unknown until we reconnect and read it.
         self._buzz_state = None
         self._async_update_listeners()
-        if self._stopped or self._expected_disconnect:
-            return
-        _LOGGER.debug(
-            "%s disconnected; will reconnect on its next advertising window",
-            self._address,
-        )
-        self._async_schedule_reconnect()
 
     @callback
     def _async_schedule_reconnect(self) -> None:
-        """Kick off a single background reconnect attempt."""
-        if self._stopped:
+        """Ensure the reconnect loop is running."""
+        if self._stopped or self._connected:
             return
         if self._reconnect_task is not None and not self._reconnect_task.done():
             return
         self._reconnect_task = self.entry.async_create_background_task(
-            self.hass, self._async_reconnect(), f"buzzer_tag reconnect {self._address}"
+            self.hass,
+            self._async_reconnect_loop(),
+            f"buzzer_tag reconnect {self._address}",
         )
 
-    async def _async_reconnect(self) -> None:
-        """Attempt to reconnect; advertisement callback retries on failure."""
-        try:
-            await self._async_connect()
-        except BleakError as err:
-            _LOGGER.debug("Reconnect to %s failed: %s", self._address, err)
+    async def _async_reconnect_loop(self) -> None:
+        """Retry connecting until we succeed or are stopped.
+
+        Runs on a backoff timer but is also woken immediately whenever the tag
+        advertises, so we connect within its short (~10 s) advertising windows
+        without busy-polling the radio while it sleeps.
+        """
+        attempt = 0
+        while not self._stopped and not self._connected:
+            attempt += 1
+            try:
+                await self._async_connect()
+            except Exception as err:  # noqa: BLE001 - transient; keep retrying
+                _LOGGER.debug(
+                    "Reconnect attempt %d to %s failed: %s",
+                    attempt,
+                    self._address,
+                    err,
+                )
+            if self._connected or self._stopped:
+                break
+            self._reconnect_wake.clear()
+            try:
+                await asyncio.wait_for(
+                    self._reconnect_wake.wait(), timeout=RECONNECT_BACKOFF_S
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                pass
+        if self._connected:
+            _LOGGER.debug("Reconnected to %s after %d attempt(s)", self._address, attempt)
 
     # --- Status push ----------------------------------------------------------
 

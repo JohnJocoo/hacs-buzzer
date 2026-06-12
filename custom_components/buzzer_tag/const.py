@@ -25,5 +25,9 @@ MELODY_TIMEOUT_S: Final = 120
 
 # After a link drop the device advertises for ~10 s, then enters a recovery
 # cycle (advertise ~10 s, sleep ~5 min). We reconnect when we see it advertise,
-# but also retry on this cadence as a backstop.
-RECONNECT_BACKOFF_S: Final = 30
+# but the retry loop also tries again on this cadence as a backstop.
+RECONNECT_BACKOFF_S: Final = 20
+
+# Periodic check that flips us into "reconnect" mode if the held link has gone
+# stale without a disconnect callback ever firing (e.g. after a battery swap).
+HEALTH_CHECK_INTERVAL_S: Final = 30
